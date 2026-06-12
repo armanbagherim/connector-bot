@@ -1,11 +1,16 @@
 import os
 import asyncio
+import json
 import uuid
 import secrets
 import sqlite3
+import ssl
 import subprocess
 from io import BytesIO
 from datetime import datetime, timedelta
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 import qrcode
 from dotenv import load_dotenv
@@ -26,6 +31,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XUI_DB = os.getenv("XUI_DB", "/etc/x-ui/x-ui.db")
 SUB_BASE_URL = os.getenv("SUB_BASE_URL", "").rstrip("/")
+PANEL_API_BASE_URL = os.getenv("PANEL_API_BASE_URL", "").rstrip("/")
+PANEL_API_TOKEN = os.getenv("PANEL_API_TOKEN", "").strip()
+PANEL_API_SKIP_TLS_VERIFY = os.getenv("PANEL_API_SKIP_TLS_VERIFY", "false").lower() == "true"
 CARD_NUMBER = os.getenv("CARD_NUMBER", "")
 CARD_OWNER = os.getenv("CARD_OWNER", "")
 RESTART_XUI_AFTER_APPROVE = os.getenv("RESTART_XUI_AFTER_APPROVE", "true").lower() == "true"
@@ -93,6 +101,55 @@ def xui_conn():
     conn = sqlite3.connect(XUI_DB)
     conn.row_factory = sqlite3.Row
     return conn
+
+def xui_api_enabled():
+    return bool(PANEL_API_BASE_URL and PANEL_API_TOKEN)
+
+def xui_api_request(method, path, payload=None):
+    if not xui_api_enabled():
+        raise RuntimeError("Panel API is not configured.")
+
+    body = None
+    headers = {
+        "Authorization": f"Bearer {PANEL_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = urllib_request.Request(
+        url=f"{PANEL_API_BASE_URL}{path}",
+        data=body,
+        headers=headers,
+        method=method.upper(),
+    )
+
+    context = None
+    if PANEL_API_BASE_URL.startswith("https://") and PANEL_API_SKIP_TLS_VERIFY:
+        context = ssl._create_unverified_context()
+
+    try:
+        with urllib_request.urlopen(request, context=context, timeout=25) as response:
+            raw_body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Panel API HTTP {exc.code}: {details}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Panel API connection failed: {exc}") from exc
+
+    if not raw_body:
+        return None
+
+    data = json.loads(raw_body)
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(data.get("msg") or "Panel API request failed.")
+
+    if isinstance(data, dict) and "obj" in data:
+        return data["obj"]
+
+    return data
 
 def get_table_columns(conn, table_name):
     try:
@@ -181,10 +238,57 @@ def restart_xui():
         pass
 
 def get_all_inbound_ids():
+    if xui_api_enabled():
+        rows = xui_api_request("GET", "/panel/api/inbounds/options") or []
+        return [int(row["id"]) for row in rows]
+
     conn = xui_conn()
     rows = conn.execute("SELECT id FROM inbounds").fetchall()
     conn.close()
     return [int(row["id"]) for row in rows]
+
+def build_api_client_payload(email, tg_id, total_bytes, expiry_ms, base_client=None):
+    payload = {
+        "email": email,
+        "totalGB": int(total_bytes),
+        "expiryTime": int(expiry_ms),
+        "tgId": int(tg_id or 0),
+        "limitIp": 0,
+        "enable": True,
+        "comment": "",
+        "reset": 0,
+    }
+
+    if not base_client:
+        return payload
+
+    payload.update(
+        {
+            "limitIp": int(base_client["limit_ip"] or 0),
+            "comment": base_client["comment"] or "",
+            "reset": int(base_client["reset"] or 0),
+            "flow": base_client["flow"] or "",
+            "security": base_client["security"] or "",
+            "subId": base_client["sub_id"] or "",
+            "password": base_client["password"] or "",
+            "auth": base_client["auth"] or "",
+            "uuid": base_client["uuid"] or "",
+            "group": base_client["group_name"] or "",
+            "reverse": None,
+        }
+    )
+    return payload
+
+def xui_api_attach_client_to_inbounds(email, inbound_ids):
+    if not inbound_ids:
+        return None
+
+    encoded_email = urllib_parse.quote(email, safe="")
+    return xui_api_request(
+        "POST",
+        f"/panel/api/clients/{encoded_email}/attach",
+        {"inboundIds": inbound_ids},
+    )
 
 def maybe_insert_client_inbound(conn, client_id, inbound_id):
     try:
@@ -493,6 +597,17 @@ def create_new_xui_client(tg_id, package_key, order_id):
     expiry_ms = int((datetime.now() + timedelta(days=pkg["days"])).timestamp() * 1000)
 
     email = f"connectme-{tg_id}-{order_id}"
+
+    if xui_api_enabled():
+        inbound_ids = get_all_inbound_ids()
+        payload = {
+            "client": build_api_client_payload(email, tg_id, total_bytes, expiry_ms),
+            "inboundIds": inbound_ids,
+        }
+        xui_api_request("POST", "/panel/api/clients/add", payload)
+        save_order_xui_email(order_id, email)
+        return email
+
     sub_id = safe_token(16)
     user_uuid = str(uuid.uuid4())
     password = safe_token(16)
@@ -554,6 +669,18 @@ def renew_xui_client(client_id, tg_id, package_key, order_id):
 
     email = client["email"]
 
+    if xui_api_enabled():
+        payload = build_api_client_payload(email, tg_id, total_bytes, new_expiry_ms, client)
+        xui_api_request(
+            "POST",
+            f"/panel/api/clients/update/{urllib_parse.quote(email, safe='')}",
+            payload,
+        )
+        xui_api_attach_client_to_inbounds(email, get_all_inbound_ids())
+        conn.close()
+        save_order_xui_email(order_id, email)
+        return email
+
     cur.execute(
         """
         UPDATE clients
@@ -608,6 +735,24 @@ def reset_subscription_link(client_id, tg_id):
     return get_client_by_id_and_tg(client_id, tg_id)
 
 def reassign_all_clients_to_all_inbounds():
+    if xui_api_enabled():
+        clients = xui_api_request("GET", "/panel/api/clients/list") or []
+        inbound_ids = get_all_inbound_ids()
+
+        emails = [client.get("email") for client in clients if client.get("email")]
+        if not emails or not inbound_ids:
+            return 0, 0
+
+        result = xui_api_request(
+            "POST",
+            "/panel/api/clients/bulkAttach",
+            {"emails": emails, "inboundIds": inbound_ids},
+        ) or {}
+
+        errors = result.get("errors") if isinstance(result, dict) else None
+        error_count = len(errors) if isinstance(errors, list) else 0
+        return len(emails) - error_count, error_count
+
     conn = xui_conn()
     cur = conn.cursor()
     clients = cur.execute(
