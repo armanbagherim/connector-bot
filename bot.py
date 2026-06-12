@@ -182,6 +182,52 @@ def maybe_insert_client_inbound(conn, client_id, inbound_id):
 def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_bytes):
     col_names = get_table_columns(conn, "client_traffics")
     has_inbound_id = "inbound_id" in col_names
+    writable_values = {
+        "enable": 1,
+        "email": email,
+        "up": 0,
+        "down": 0,
+        "expiry_time": expiry_ms,
+        "total": total_bytes,
+        "reset": 0,
+        "last_online": 0,
+    }
+
+    def insert_traffic_row(target_inbound_id):
+        insert_values = dict(writable_values)
+        if "inbound_id" in col_names:
+            insert_values["inbound_id"] = target_inbound_id
+
+        filtered_items = [(key, value) for key, value in insert_values.items() if key in col_names]
+        fields = ", ".join(key for key, _ in filtered_items)
+        placeholders = ", ".join("?" for _ in filtered_items)
+        values = [value for _, value in filtered_items]
+
+        cur.execute(
+            f"INSERT INTO client_traffics ({fields}) VALUES ({placeholders})",
+            values,
+        )
+
+    def update_traffic_row(where_clause, where_params):
+        update_fields = [
+            (key, value)
+            for key, value in (
+                ("enable", 1),
+                ("expiry_time", expiry_ms),
+                ("total", total_bytes),
+            )
+            if key in col_names
+        ]
+
+        if not update_fields:
+            return
+
+        set_clause = ", ".join(f"{key} = ?" for key, _ in update_fields)
+        params = [value for _, value in update_fields] + list(where_params)
+        cur.execute(
+            f"UPDATE client_traffics SET {set_clause} WHERE {where_clause}",
+            params,
+        )
 
     if has_inbound_id and inbound_ids:
         for inbound_id in inbound_ids:
@@ -191,24 +237,9 @@ def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_b
             ).fetchone()
 
             if not traffic_exists:
-                cur.execute(
-                    """
-                    INSERT INTO client_traffics (
-                        inbound_id, enable, email, up, down, expiry_time, total, reset, last_online
-                    )
-                    VALUES (?, 1, ?, 0, 0, ?, ?, 0, 0)
-                    """,
-                    (inbound_id, email, expiry_ms, total_bytes),
-                )
+                insert_traffic_row(inbound_id)
             else:
-                cur.execute(
-                    """
-                    UPDATE client_traffics
-                    SET enable = 1, expiry_time = ?, total = ?
-                    WHERE email = ? AND inbound_id = ?
-                    """,
-                    (expiry_ms, total_bytes, email, inbound_id),
-                )
+                update_traffic_row("email = ? AND inbound_id = ?", (email, inbound_id))
         return
 
     traffic_exists = cur.execute(
@@ -219,24 +250,9 @@ def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_b
     primary_inbound_id = inbound_ids[0] if inbound_ids else 1
 
     if not traffic_exists:
-        cur.execute(
-            """
-            INSERT INTO client_traffics (
-                inbound_id, enable, email, up, down, expiry_time, total, reset, last_online
-            )
-            VALUES (?, 1, ?, 0, 0, ?, ?, 0, 0)
-            """,
-            (primary_inbound_id, email, expiry_ms, total_bytes),
-        )
+        insert_traffic_row(primary_inbound_id)
     else:
-        cur.execute(
-            """
-            UPDATE client_traffics
-            SET enable = 1, expiry_time = ?, total = ?
-            WHERE email = ?
-            """,
-            (expiry_ms, total_bytes, email),
-        )
+        update_traffic_row("email = ?", (email,))
 
 def assign_client_to_all_inbounds(conn, cur, client_id, email, expiry_ms, total_bytes):
     inbound_ids = get_all_inbound_ids()
