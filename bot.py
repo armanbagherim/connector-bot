@@ -1,4 +1,5 @@
 import os
+import asyncio
 import uuid
 import secrets
 import sqlite3
@@ -39,6 +40,7 @@ BOT_DB = "/opt/xui-user-bot/bot.sqlite"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+REASSIGN_ALL_LOCK = asyncio.Lock()
 
 PACKAGES = {
     "unlimited_300": {
@@ -98,6 +100,29 @@ def get_table_columns(conn, table_name):
     except Exception:
         return []
     return [row["name"] for row in rows]
+
+def has_unique_index_on_columns(conn, table_name, target_columns):
+    try:
+        index_rows = conn.execute(f"PRAGMA index_list({table_name});").fetchall()
+    except Exception:
+        return False
+
+    normalized_target = tuple(target_columns)
+
+    for index_row in index_rows:
+        if not index_row["unique"]:
+            continue
+
+        try:
+            info_rows = conn.execute(f"PRAGMA index_info({index_row['name']});").fetchall()
+        except Exception:
+            continue
+
+        index_columns = tuple(row["name"] for row in info_rows)
+        if index_columns == normalized_target:
+            return True
+
+    return False
 
 def bot_conn():
     conn = sqlite3.connect(BOT_DB)
@@ -182,6 +207,7 @@ def maybe_insert_client_inbound(conn, client_id, inbound_id):
 def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_bytes):
     col_names = get_table_columns(conn, "client_traffics")
     has_inbound_id = "inbound_id" in col_names
+    email_is_unique = has_unique_index_on_columns(conn, "client_traffics", ("email",))
     writable_values = {
         "enable": 1,
         "email": email,
@@ -229,7 +255,7 @@ def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_b
             params,
         )
 
-    if has_inbound_id and inbound_ids:
+    if has_inbound_id and inbound_ids and not email_is_unique:
         for inbound_id in inbound_ids:
             traffic_exists = cur.execute(
                 "SELECT id FROM client_traffics WHERE email = ? AND inbound_id = ? LIMIT 1",
@@ -617,8 +643,16 @@ async def run_admin_reassign_all(message: types.Message):
         await message.answer("دسترسی ندارید.", reply_markup=main_menu(message.from_user.id))
         return
 
+    if REASSIGN_ALL_LOCK.locked():
+        await message.answer(
+            "ری‌اساین همه همین الان در حال اجراست. چند لحظه بعد دوباره بررسی کنید.",
+            reply_markup=main_menu(message.from_user.id),
+        )
+        return
+
     try:
-        reassigned, skipped = reassign_all_clients_to_all_inbounds()
+        async with REASSIGN_ALL_LOCK:
+            reassigned, skipped = reassign_all_clients_to_all_inbounds()
         await message.answer(
             f"ری‌اساین همه انجام شد.\n\n"
             f"کلاینت‌های پردازش‌شده: {reassigned}\n"
