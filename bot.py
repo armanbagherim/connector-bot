@@ -1,4 +1,3 @@
-cat > /opt/xui-user-bot/bot.py <<'PY'
 import os
 import uuid
 import secrets
