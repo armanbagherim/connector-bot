@@ -67,14 +67,19 @@ PACKAGES = {
     },
 }
 
-menu = ReplyKeyboardMarkup(
-    keyboard=[
+def main_menu(user_id=None):
+    keyboard = [
         [KeyboardButton(text="🛒 خرید اشتراک")],
         [KeyboardButton(text="🧩 مدیریت اشتراک‌ها")],
         [KeyboardButton(text="ℹ️ راهنما")],
-    ],
-    resize_keyboard=True,
-)
+    ]
+
+    if user_id is not None and is_admin(user_id):
+        keyboard.append([KeyboardButton(text="🛠 ری‌اساین همه")])
+
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+menu = main_menu()
 
 def now_ms():
     return int(datetime.now().timestamp() * 1000)
@@ -86,6 +91,13 @@ def xui_conn():
     conn = sqlite3.connect(XUI_DB)
     conn.row_factory = sqlite3.Row
     return conn
+
+def get_table_columns(conn, table_name):
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name});").fetchall()
+    except Exception:
+        return []
+    return [row["name"] for row in rows]
 
 def bot_conn():
     conn = sqlite3.connect(BOT_DB)
@@ -151,8 +163,7 @@ def get_all_inbound_ids():
 
 def maybe_insert_client_inbound(conn, client_id, inbound_id):
     try:
-        cols = conn.execute("PRAGMA table_info(client_inbounds);").fetchall()
-        col_names = [c["name"] for c in cols]
+        col_names = get_table_columns(conn, "client_inbounds")
 
         if "client_id" in col_names and "inbound_id" in col_names:
             exists = conn.execute(
@@ -168,11 +179,37 @@ def maybe_insert_client_inbound(conn, client_id, inbound_id):
     except Exception:
         pass
 
-def assign_client_to_all_inbounds(conn, cur, client_id, email, expiry_ms, total_bytes):
-    inbound_ids = get_all_inbound_ids()
+def ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_bytes):
+    col_names = get_table_columns(conn, "client_traffics")
+    has_inbound_id = "inbound_id" in col_names
 
-    for inbound_id in inbound_ids:
-        maybe_insert_client_inbound(conn, client_id, inbound_id)
+    if has_inbound_id and inbound_ids:
+        for inbound_id in inbound_ids:
+            traffic_exists = cur.execute(
+                "SELECT id FROM client_traffics WHERE email = ? AND inbound_id = ? LIMIT 1",
+                (email, inbound_id),
+            ).fetchone()
+
+            if not traffic_exists:
+                cur.execute(
+                    """
+                    INSERT INTO client_traffics (
+                        inbound_id, enable, email, up, down, expiry_time, total, reset, last_online
+                    )
+                    VALUES (?, 1, ?, 0, 0, ?, ?, 0, 0)
+                    """,
+                    (inbound_id, email, expiry_ms, total_bytes),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE client_traffics
+                    SET enable = 1, expiry_time = ?, total = ?
+                    WHERE email = ? AND inbound_id = ?
+                    """,
+                    (expiry_ms, total_bytes, email, inbound_id),
+                )
+        return
 
     traffic_exists = cur.execute(
         "SELECT id FROM client_traffics WHERE email = ? LIMIT 1",
@@ -200,6 +237,14 @@ def assign_client_to_all_inbounds(conn, cur, client_id, email, expiry_ms, total_
             """,
             (expiry_ms, total_bytes, email),
         )
+
+def assign_client_to_all_inbounds(conn, cur, client_id, email, expiry_ms, total_bytes):
+    inbound_ids = get_all_inbound_ids()
+
+    for inbound_id in inbound_ids:
+        maybe_insert_client_inbound(conn, client_id, inbound_id)
+
+    ensure_client_traffic_rows(conn, cur, inbound_ids, email, expiry_ms, total_bytes)
 
 def create_order(tg_id, tg_username, tg_full_name, package_key):
     conn = bot_conn()
@@ -520,6 +565,57 @@ def reset_subscription_link(client_id, tg_id):
     restart_xui()
     return get_client_by_id_and_tg(client_id, tg_id)
 
+def reassign_all_clients_to_all_inbounds():
+    conn = xui_conn()
+    cur = conn.cursor()
+    clients = cur.execute(
+        "SELECT id, email, expiry_time, total_gb FROM clients ORDER BY id ASC"
+    ).fetchall()
+
+    reassigned = 0
+    skipped = 0
+
+    for client in clients:
+        email = client["email"]
+        if not email:
+            skipped += 1
+            continue
+
+        assign_client_to_all_inbounds(
+            conn=conn,
+            cur=cur,
+            client_id=client["id"],
+            email=email,
+            expiry_ms=int(client["expiry_time"] or 0),
+            total_bytes=int(client["total_gb"] or 0),
+        )
+        reassigned += 1
+
+    conn.commit()
+    conn.close()
+    restart_xui()
+    return reassigned, skipped
+
+async def run_admin_reassign_all(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("دسترسی ندارید.", reply_markup=main_menu(message.from_user.id))
+        return
+
+    try:
+        reassigned, skipped = reassign_all_clients_to_all_inbounds()
+        await message.answer(
+            f"ری‌اساین همه انجام شد.\n\n"
+            f"کلاینت‌های پردازش‌شده: {reassigned}\n"
+            f"ردشده/ناقص: {skipped}",
+            reply_markup=main_menu(message.from_user.id),
+        )
+    except Exception:
+        await message.answer(
+            "هنگام ری‌اساین همه خطا رخ داد. لاگ سرور را بررسی کنید.",
+            reply_markup=main_menu(message.from_user.id),
+        )
+        raise
+
 async def send_final_config_to_user(tg_id, client, pkg):
     link = subscription_link(client)
 
@@ -595,7 +691,7 @@ async def start(message: types.Message):
         "سلام 👋\n\n"
         "به ربات مدیریت اشتراک خوش آمدید.\n"
         "از منوی پایین می‌توانید خرید کنید یا اشتراک‌های خود را مدیریت کنید.",
-        reply_markup=menu,
+        reply_markup=main_menu(message.from_user.id),
     )
 
 @dp.message(Command("buy"))
@@ -605,6 +701,10 @@ async def buy(message: types.Message):
 @dp.message(Command("manage"))
 async def manage(message: types.Message):
     await send_services(message)
+
+@dp.message(Command("reassignall"))
+async def admin_reassign_all_cmd(message: types.Message):
+    await run_admin_reassign_all(message)
 
 @dp.message(F.text == "🛒 خرید اشتراک")
 async def buy_btn(message: types.Message):
@@ -621,8 +721,12 @@ async def help_btn(message: types.Message):
         "🛒 خرید اشتراک: انتخاب پکیج، کارت به کارت، ارسال رسید\n"
         "🧩 مدیریت اشتراک‌ها: مشاهده حجم، QR، لینک، تغییر لینک، تاریخ انقضا و تمدید\n\n"
         "بعد از تایید رسید توسط ادمین، اشتراک به صورت خودکار ساخته می‌شود.",
-        reply_markup=menu,
+        reply_markup=main_menu(message.from_user.id),
     )
+
+@dp.message(F.text == "🛠 ری‌اساین همه")
+async def admin_reassign_all_btn(message: types.Message):
+    await run_admin_reassign_all(message)
 
 @dp.callback_query(F.data == "noop")
 async def noop(callback: CallbackQuery):
